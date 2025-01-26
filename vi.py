@@ -1,373 +1,277 @@
 import sys
 import os
-import time
-import json
 from datetime import datetime
+import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLineEdit, QPushButton, QLabel, 
-                            QProgressBar, QTextEdit, QMessageBox, QDialog)
+                            QProgressBar, QTextEdit, QFileDialog, QMessageBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-import instaloader
-from instaloader.exceptions import LoginRequiredException, BadCredentialsException
+from instagrapi import Client
+import requests
 
-class LoginDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('Instagram Giriş')
-        self.setModal(True)
-        self.setup_ui()
+class InstagramDownloaderThread(QThread):
+    progress_updated = pyqtSignal(str)
+    download_complete = pyqtSignal(str)
+    download_error = pyqtSignal(str)
+    progress_count = pyqtSignal(int)
 
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #fafafa;
-            }
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #dbdbdb;
-                border-radius: 4px;
-                background-color: white;
-                min-width: 250px;
-            }
-            QPushButton {
-                background-color: #0095f6;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-        """)
-
-        # Username input
-        username_label = QLabel('Kullanıcı Adı:')
-        layout.addWidget(username_label)
-        self.username_input = QLineEdit()
-        layout.addWidget(self.username_input)
-
-        # Password input
-        password_label = QLabel('Şifre:')
-        layout.addWidget(password_label)
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.password_input)
-
-        # Login button
-        self.login_button = QPushButton('Giriş Yap')
-        self.login_button.clicked.connect(self.accept)
-        layout.addWidget(self.login_button)
-
-        self.setLayout(layout)
-
-class InstagramDownloader(QThread):
-    progress_updated = pyqtSignal(int)
-    status_updated = pyqtSignal(str)
-    
-    def __init__(self, hashtag, video_count=10):
+    def __init__(self, hashtag, download_path, limit=None, username="", password=""):
         super().__init__()
         self.hashtag = hashtag
-        self.video_count = video_count
+        self.download_path = download_path
+        self.limit = limit
+        self.username = username
+        self.password = password
         self.is_running = True
-        self.L = None
-        self.initialize_loader()
+        self.client = Client()
 
-    def initialize_loader(self):
-        self.L = instaloader.Instaloader(
-            download_videos=True,
-            download_video_thumbnails=False,
-            download_geotags=False,
-            download_comments=False,
-            save_metadata=False,
-            compress_json=False,
-            filename_pattern='{date_utc:%Y%m%d_%H%M%S}_{shortcode}'
-        )
-
-    def login(self, username, password):
+    def download_media(self, url, filename):
         try:
-            self.status_updated.emit("Giriş yapılıyor...")
-            session_file = f"{username}_session"
-
-            # Önce mevcut oturumu yüklemeyi dene
-            try:
-                self.L.load_session_from_file(username, session_file)
-                # Oturumu test et
-                test_profile = instaloader.Profile.from_username(self.L.context, username)
-                self.status_updated.emit("Mevcut oturum yüklendi!")
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=1024):
+                        if chunk:
+                            f.write(chunk)
                 return True
-            except (FileNotFoundError, LoginRequiredException):
-                # Yeni oturum oluştur
-                try:
-                    self.L.login(username, password)
-                    self.L.save_session_to_file(session_file)
-                    self.status_updated.emit("Yeni oturum oluşturuldu!")
-                    return True
-                except BadCredentialsException:
-                    self.status_updated.emit("Hatalı kullanıcı adı veya şifre!")
-                    return False
-
+            return False
         except Exception as e:
-            self.status_updated.emit(f"Giriş hatası: {str(e)}")
+            self.download_error.emit(f"İndirme hatası: {str(e)}")
             return False
 
     def run(self):
         try:
-            self.status_updated.emit("Hashtag araması başlatılıyor...")
-            posts = []
-            
-            try:
-                hashtag_obj = instaloader.Hashtag.from_name(self.L.context, self.hashtag)
-                self.status_updated.emit(f"#{self.hashtag} için içerikler alınıyor...")
-                
-                for post in hashtag_obj.get_posts():
-                    if not self.is_running:
-                        break
-                        
-                    if post.is_video and len(posts) < self.video_count:
-                        posts.append(post)
-                        self.status_updated.emit(f"Video bulundu: {len(posts)}/{self.video_count}")
-                    
-                    if len(posts) >= self.video_count:
-                        break
-                        
-                    time.sleep(1)  # Rate limiting
-                    
-            except LoginRequiredException:
-                self.status_updated.emit("Giriş yapılması gerekiyor!")
-                return
-            except Exception as e:
-                self.status_updated.emit(f"Hashtag arama hatası: {str(e)}")
-                return
+            # Login to Instagram
+            self.progress_updated.emit("Instagram'a giriş yapılıyor...")
+            self.client.login(self.username, self.password)
+            self.progress_updated.emit("Giriş başarılı!")
 
-            if not posts:
-                self.status_updated.emit("Video bulunamadı.")
-                return
+            # Get hashtag medias
+            self.progress_updated.emit(f"#{self.hashtag} için medyalar aranıyor...")
+            medias = self.client.hashtag_medias_top(self.hashtag, amount=self.limit or 20)
 
-            # İndirme klasörünü oluştur
-            download_path = os.path.join(os.getcwd(), 'downloads')
-            if not os.path.exists(download_path):
-                os.makedirs(download_path)
-
-            # Videoları indir
-            for index, post in enumerate(posts):
+            downloaded_count = 0
+            for media in medias:
                 if not self.is_running:
                     break
 
                 try:
-                    self.status_updated.emit(f"Video indiriliyor: {index + 1}/{len(posts)}")
-                    self.L.download_post(post, target=download_path)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     
-                    progress = int((index + 1) / len(posts) * 100)
-                    self.progress_updated.emit(progress)
-                    
-                    if index < len(posts) - 1:
-                        time.sleep(2)  # Rate limiting
+                    if media.media_type == 1:  # Photo
+                        url = media.thumbnail_url
+                        ext = '.jpg'
+                    elif media.media_type == 2:  # Video
+                        url = media.video_url
+                        ext = '.mp4'
+                    else:
+                        continue
+
+                    filename = os.path.join(
+                        self.download_path,
+                        f"{self.hashtag}_{timestamp}_{downloaded_count}{ext}"
+                    )
+
+                    if self.download_media(url, filename):
+                        downloaded_count += 1
+                        self.progress_count.emit(downloaded_count)
+                        self.progress_updated.emit(f"İndirilen medya {downloaded_count}: {os.path.basename(filename)}")
+                        time.sleep(1)  # Rate limiting
 
                 except Exception as e:
-                    self.status_updated.emit(f"İndirme hatası: {str(e)}")
+                    self.download_error.emit(f"Medya işleme hatası: {str(e)}")
                     continue
 
-            if self.is_running:
-                self.status_updated.emit("İndirme tamamlandı!")
-                self.status_updated.emit(f"Videolar '{download_path}' klasörüne kaydedildi.")
-            else:
-                self.status_updated.emit("İndirme durduruldu.")
+            self.download_complete.emit(f"Toplam {downloaded_count} medya indirildi.")
 
         except Exception as e:
-            self.status_updated.emit(f"Genel hata: {str(e)}")
+            self.download_error.emit(f"Genel hata: {str(e)}")
+        finally:
+            try:
+                self.client.logout()
+            except:
+                pass
 
     def stop(self):
         self.is_running = False
 
-class MainWindow(QMainWindow):
+class InstagramDownloaderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.initUI()
-        self.downloader = None
+        self.downloader_thread = None
 
     def initUI(self):
-        self.setWindowTitle('Instagram Video İndirici')
-        self.setGeometry(100, 100, 800, 600)
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #fafafa;
-            }
-            QLabel {
-                color: #262626;
-                font-size: 14px;
-            }
-            QPushButton {
-                background-color: #0095f6;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-                min-width: 100px;
-            }
-            QPushButton:disabled {
-                background-color: #B2DFFC;
-            }
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #dbdbdb;
-                border-radius: 4px;
-                background-color: white;
-            }
-            QTextEdit {
-                border: 1px solid #dbdbdb;
-                border-radius: 4px;
-                background-color: white;
-            }
-        """)
+        self.setWindowTitle('Instagram Hashtag İndirici')
+        self.setGeometry(100, 100, 600, 500)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(central_widget)
 
-        # Header
-        header_label = QLabel('Instagram Video İndirici')
-        header_label.setAlignment(Qt.AlignCenter)
-        header_label.setStyleSheet('font-size: 24px; font-weight: bold; margin: 20px;')
-        layout.addWidget(header_label)
-
-        # Input fields
-        input_layout = QHBoxLayout()
+        # Kullanıcı girişi
+        login_group = QVBoxLayout()
         
-        input_group = QVBoxLayout()
-        hashtag_label = QLabel('Hashtag:')
+        username_layout = QHBoxLayout()
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText('Instagram kullanıcı adı')
+        username_layout.addWidget(QLabel('Kullanıcı Adı:'))
+        username_layout.addWidget(self.username_input)
+        login_group.addLayout(username_layout)
+
+        password_layout = QHBoxLayout()
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText('Instagram şifresi')
+        self.password_input.setEchoMode(QLineEdit.Password)
+        password_layout.addWidget(QLabel('Şifre:'))
+        password_layout.addWidget(self.password_input)
+        login_group.addLayout(password_layout)
+
+        layout.addLayout(login_group)
+
+        # Hashtag girişi
+        hashtag_layout = QHBoxLayout()
         self.hashtag_input = QLineEdit()
-        self.hashtag_input.setPlaceholderText('Hashtag giriniz (# olmadan)')
-        input_group.addWidget(hashtag_label)
-        input_group.addWidget(self.hashtag_input)
-        
-        count_group = QVBoxLayout()
-        count_label = QLabel('Video Sayısı:')
-        self.count_input = QLineEdit()
-        self.count_input.setPlaceholderText('10')
-        self.count_input.setText('10')
-        self.count_input.setMaximumWidth(100)
-        count_group.addWidget(count_label)
-        count_group.addWidget(self.count_input)
-        
-        input_layout.addLayout(input_group)
-        input_layout.addLayout(count_group)
-        layout.addLayout(input_layout)
+        self.hashtag_input.setPlaceholderText('Hashtag girin (# olmadan)')
+        hashtag_layout.addWidget(QLabel('Hashtag:'))
+        hashtag_layout.addWidget(self.hashtag_input)
+        layout.addLayout(hashtag_layout)
 
-        # Buttons
-        button_layout = QHBoxLayout()
-        
-        self.login_button = QPushButton('Giriş Yap')
-        self.login_button.clicked.connect(self.show_login_dialog)
-        button_layout.addWidget(self.login_button)
-        
-        self.download_button = QPushButton('İndir')
+        # Limit girişi
+        limit_layout = QHBoxLayout()
+        self.limit_input = QLineEdit()
+        self.limit_input.setPlaceholderText('Boş bırakın veya sayı girin')
+        limit_layout.addWidget(QLabel('Medya Limiti:'))
+        limit_layout.addWidget(self.limit_input)
+        layout.addLayout(limit_layout)
+
+        # Kayıt yeri seçimi
+        path_layout = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setReadOnly(True)
+        self.path_button = QPushButton('Kayıt Yeri Seç')
+        self.path_button.clicked.connect(self.select_download_path)
+        path_layout.addWidget(self.path_input)
+        path_layout.addWidget(self.path_button)
+        layout.addLayout(path_layout)
+
+        # Butonlar
+        self.download_button = QPushButton('İndirmeyi Başlat')
         self.download_button.clicked.connect(self.start_download)
-        self.download_button.setEnabled(False)
-        button_layout.addWidget(self.download_button)
-        
-        self.stop_button = QPushButton('Durdur')
+        layout.addWidget(self.download_button)
+
+        self.stop_button = QPushButton('İndirmeyi Durdur')
         self.stop_button.clicked.connect(self.stop_download)
         self.stop_button.setEnabled(False)
-        button_layout.addWidget(self.stop_button)
-        
-        layout.addLayout(button_layout)
+        layout.addWidget(self.stop_button)
 
-        # Progress bar
+        # İlerleme çubuğu
         self.progress_bar = QProgressBar()
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #dbdbdb;
-                border-radius: 4px;
-                text-align: center;
-                height: 25px;
-            }
-            QProgressBar::chunk {
-                background-color: #0095f6;
-            }
-        """)
         layout.addWidget(self.progress_bar)
 
-        # Status text
-        self.status_text = QTextEdit()
-        self.status_text.setReadOnly(True)
-        self.status_text.setMinimumHeight(300)
-        layout.addWidget(self.status_text)
+        # Log alanı
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
 
-        central_widget.setLayout(layout)
+        self.statusBar().showMessage('Hazır')
 
-    def show_login_dialog(self):
-        dialog = LoginDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            username = dialog.username_input.text().strip()
-            password = dialog.password_input.text().strip()
+    def select_download_path(self):
+        folder = QFileDialog.getExistingDirectory(self, 'İndirme Klasörünü Seç')
+        if folder:
+            self.path_input.setText(folder)
+
+    def log_message(self, message):
+        self.log_text.append(f"{datetime.now().strftime('%H:%M:%S')}: {message}")
+
+    def validate_inputs(self):
+        if not self.username_input.text().strip():
+            QMessageBox.warning(self, 'Hata', 'Kullanıcı adı gereklidir.')
+            return False
             
-            if not username or not password:
-                QMessageBox.warning(self, "Hata", "Kullanıcı adı ve şifre gerekli!")
-                return
+        if not self.password_input.text().strip():
+            QMessageBox.warning(self, 'Hata', 'Şifre gereklidir.')
+            return False
 
-            self.downloader = InstagramDownloader("temp", 1)
-            if self.downloader.login(username, password):
-                self.login_button.setText("Giriş Yapıldı")
-                self.login_button.setEnabled(False)
-                self.download_button.setEnabled(True)
-                self.update_status("Giriş başarılı! İndirme işlemi için hazır.")
-            else:
-                QMessageBox.warning(self, "Hata", "Giriş başarısız! Lütfen bilgilerinizi kontrol edin.")
+        if not self.hashtag_input.text().strip():
+            QMessageBox.warning(self, 'Hata', 'Hashtag gereklidir.')
+            return False
+
+        if not self.path_input.text().strip():
+            QMessageBox.warning(self, 'Hata', 'İndirme klasörü seçilmelidir.')
+            return False
+
+        return True
 
     def start_download(self):
+        if not self.validate_inputs():
+            return
+
         hashtag = self.hashtag_input.text().strip()
+        download_path = self.path_input.text().strip()
+        limit_text = self.limit_input.text().strip()
+        username = self.username_input.text().strip()
+        password = self.password_input.text().strip()
+
         try:
-            video_count = int(self.count_input.text())
-            if video_count <= 0:
-                raise ValueError()
+            limit = int(limit_text) if limit_text else None
         except ValueError:
-            QMessageBox.warning(self, "Hata", "Geçerli bir video sayısı giriniz!")
-            return
-
-        if not hashtag:
-            QMessageBox.warning(self, "Hata", "Lütfen bir hashtag giriniz!")
-            return
-
-        self.downloader = InstagramDownloader(hashtag, video_count)
-        if not self.downloader.login(self.downloader.L.context.username, None):
-            QMessageBox.warning(self, "Hata", "Oturum hatası! Lütfen tekrar giriş yapın.")
-            self.login_button.setEnabled(True)
-            self.download_button.setEnabled(False)
+            QMessageBox.warning(self, 'Hata', 'Geçerli bir sayı girin.')
             return
 
         self.download_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.setValue(0)
-        self.status_text.clear()
 
-        self.downloader.progress_updated.connect(self.update_progress)
-        self.downloader.status_updated.connect(self.update_status)
-        self.downloader.finished.connect(self.download_finished)
-        self.downloader.start()
+        self.downloader_thread = InstagramDownloaderThread(
+            hashtag, download_path, limit, username, password
+        )
+        self.downloader_thread.progress_updated.connect(self.log_message)
+        self.downloader_thread.download_complete.connect(self.download_finished)
+        self.downloader_thread.download_error.connect(self.log_message)
+        self.downloader_thread.progress_count.connect(self.update_progress)
+        self.downloader_thread.start()
 
     def stop_download(self):
-        if self.downloader:
-            self.downloader.stop()
-            self.update_status("İndirme durduruldu.")
-            self.download_finished()
+        if self.downloader_thread and self.downloader_thread.isRunning():
+            self.downloader_thread.stop()
+            self.log_message("İndirme durduruldu...")
+            self.stop_button.setEnabled(False)
+            self.download_button.setEnabled(True)
 
-    def update_progress(self, value):
-        self.progress_bar.setValue(value)
-
-    def update_status(self, message):
-        self.status_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-        self.status_text.verticalScrollBar().setValue(
-            self.status_text.verticalScrollBar().maximum()
-        )
-
-    def download_finished(self):
+    def download_finished(self, message):
+        self.log_message(message)
         self.download_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.statusBar().showMessage('İndirme tamamlandı')
+        QMessageBox.information(self, 'Tamamlandı', message)
 
-if __name__ == '__main__':
+    def update_progress(self, count):
+        if self.limit_input.text().strip():
+            limit = int(self.limit_input.text())
+            progress = (count / limit) * 100
+            self.progress_bar.setValue(int(progress))
+
+    def closeEvent(self, event):
+        if self.downloader_thread and self.downloader_thread.isRunning():
+            reply = QMessageBox.question(
+                self, 'Çıkış',
+                'İndirme işlemi devam ediyor. Çıkmak istediğinizden emin misiniz?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.stop_download()
+                event.accept()
+            else:
+                event.ignore()
+
+def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    ex = MainWindow()
+    ex = InstagramDownloaderGUI()
     ex.show()
     sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
