@@ -2,12 +2,48 @@ import sys
 import os
 from datetime import datetime
 import time
+import hashlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLineEdit, QPushButton, QLabel, 
-                            QProgressBar, QTextEdit, QFileDialog, QMessageBox)
+                            QProgressBar, QTextEdit, QFileDialog, QMessageBox,
+                            QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from instagrapi import Client
 import requests
+import json
+
+class MediaTracker:
+    def __init__(self, file_path="downloaded_media.json"):
+        self.file_path = file_path
+        self.downloaded_media = self.load_downloaded_media()
+
+    def load_downloaded_media(self):
+        try:
+            if os.path.exists(self.file_path):
+                with open(self.file_path, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception:
+            return {}
+
+    def save_downloaded_media(self):
+        try:
+            with open(self.file_path, 'w') as f:
+                json.dump(self.downloaded_media, f)
+        except Exception as e:
+            print(f"Error saving media tracker: {e}")
+
+    def is_media_downloaded(self, media_id, media_url):
+        media_hash = hashlib.md5(media_url.encode()).hexdigest()
+        return media_hash in self.downloaded_media
+
+    def add_media(self, media_id, media_url):
+        media_hash = hashlib.md5(media_url.encode()).hexdigest()
+        self.downloaded_media[media_hash] = {
+            'media_id': media_id,
+            'downloaded_at': datetime.now().isoformat()
+        }
+        self.save_downloaded_media()
 
 class InstagramDownloaderThread(QThread):
     progress_updated = pyqtSignal(str)
@@ -15,7 +51,8 @@ class InstagramDownloaderThread(QThread):
     download_error = pyqtSignal(str)
     progress_count = pyqtSignal(int)
 
-    def __init__(self, hashtag, download_path, limit=None, username="", password=""):
+    def __init__(self, hashtag, download_path, limit=None, username="", password="", 
+                 download_photos=True, download_videos=True):
         super().__init__()
         self.hashtag = hashtag
         self.download_path = download_path
@@ -24,15 +61,23 @@ class InstagramDownloaderThread(QThread):
         self.password = password
         self.is_running = True
         self.client = Client()
+        self.download_photos = download_photos
+        self.download_videos = download_videos
+        self.media_tracker = MediaTracker()
 
     def download_media(self, url, filename):
         try:
+            if self.media_tracker.is_media_downloaded(filename, url):
+                self.progress_updated.emit(f"Medya zaten indirilmiş: {os.path.basename(filename)}")
+                return False
+
             response = requests.get(url, stream=True)
             if response.status_code == 200:
                 with open(filename, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=1024):
                         if chunk:
                             f.write(chunk)
+                self.media_tracker.add_media(filename, url)
                 return True
             return False
         except Exception as e:
@@ -41,16 +86,15 @@ class InstagramDownloaderThread(QThread):
 
     def run(self):
         try:
-            # Login to Instagram
             self.progress_updated.emit("Instagram'a giriş yapılıyor...")
             self.client.login(self.username, self.password)
             self.progress_updated.emit("Giriş başarılı!")
 
-            # Get hashtag medias
             self.progress_updated.emit(f"#{self.hashtag} için medyalar aranıyor...")
             medias = self.client.hashtag_medias_top(self.hashtag, amount=self.limit or 20)
 
             downloaded_count = 0
+            skipped_count = 0
             for media in medias:
                 if not self.is_running:
                     break
@@ -58,10 +102,10 @@ class InstagramDownloaderThread(QThread):
                 try:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     
-                    if media.media_type == 1:  # Photo
+                    if media.media_type == 1 and self.download_photos:  # Photo
                         url = media.thumbnail_url
                         ext = '.jpg'
-                    elif media.media_type == 2:  # Video
+                    elif media.media_type == 2 and self.download_videos:  # Video
                         url = media.video_url
                         ext = '.mp4'
                     else:
@@ -76,13 +120,17 @@ class InstagramDownloaderThread(QThread):
                         downloaded_count += 1
                         self.progress_count.emit(downloaded_count)
                         self.progress_updated.emit(f"İndirilen medya {downloaded_count}: {os.path.basename(filename)}")
-                        time.sleep(1)  # Rate limiting
+                    else:
+                        skipped_count += 1
+                    
+                    time.sleep(1)  # Rate limiting
 
                 except Exception as e:
                     self.download_error.emit(f"Medya işleme hatası: {str(e)}")
                     continue
 
-            self.download_complete.emit(f"Toplam {downloaded_count} medya indirildi.")
+            self.download_complete.emit(
+                f"Toplam {downloaded_count} medya indirildi, {skipped_count} medya atlandı.")
 
         except Exception as e:
             self.download_error.emit(f"Genel hata: {str(e)}")
@@ -128,6 +176,16 @@ class InstagramDownloaderGUI(QMainWindow):
         login_group.addLayout(password_layout)
 
         layout.addLayout(login_group)
+
+        # Medya türü seçimi
+        media_type_layout = QHBoxLayout()
+        self.photo_checkbox = QCheckBox('Fotoğrafları İndir')
+        self.video_checkbox = QCheckBox('Videoları İndir')
+        self.photo_checkbox.setChecked(True)
+        self.video_checkbox.setChecked(True)
+        media_type_layout.addWidget(self.photo_checkbox)
+        media_type_layout.addWidget(self.video_checkbox)
+        layout.addLayout(media_type_layout)
 
         # Hashtag girişi
         hashtag_layout = QHBoxLayout()
@@ -201,6 +259,10 @@ class InstagramDownloaderGUI(QMainWindow):
             QMessageBox.warning(self, 'Hata', 'İndirme klasörü seçilmelidir.')
             return False
 
+        if not self.photo_checkbox.isChecked() and not self.video_checkbox.isChecked():
+            QMessageBox.warning(self, 'Hata', 'En az bir medya türü seçilmelidir.')
+            return False
+
         return True
 
     def start_download(self):
@@ -224,7 +286,13 @@ class InstagramDownloaderGUI(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.downloader_thread = InstagramDownloaderThread(
-            hashtag, download_path, limit, username, password
+            hashtag=hashtag,
+            download_path=download_path,
+            limit=limit,
+            username=username,
+            password=password,
+            download_photos=self.photo_checkbox.isChecked(),
+            download_videos=self.video_checkbox.isChecked()
         )
         self.downloader_thread.progress_updated.connect(self.log_message)
         self.downloader_thread.download_complete.connect(self.download_finished)
