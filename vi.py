@@ -1,17 +1,18 @@
 import sys
 import os
-from datetime import datetime
-import time
 import hashlib
 import json
+import time
+import logging
+import sqlite3
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QLineEdit, QPushButton, QLabel, 
-                            QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-                            QCheckBox)
+                          QHBoxLayout, QLineEdit, QPushButton, QLabel, 
+                          QProgressBar, QTextEdit, QFileDialog, QMessageBox,
+                          QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from instagrapi import Client
 import requests
-import logging
 
 # Logging ayarları
 logging.basicConfig(
@@ -20,49 +21,68 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-class MediaTracker:
-    def __init__(self, file_path="downloaded_media.json"):
-        self.file_path = file_path
-        self.downloaded_media = self.load_downloaded_media()
+class SQLiteMediaTracker:
+    def __init__(self, db_path="downloads.db"):
+        self.db_path = db_path
+        self.init_database()
 
-    def load_downloaded_media(self):
+    def init_database(self):
         try:
-            if os.path.exists(self.file_path):
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            return {}
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS downloaded_media (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        media_id TEXT NOT NULL,
+                        media_hash TEXT UNIQUE NOT NULL,
+                        media_url TEXT NOT NULL,
+                        file_path TEXT NOT NULL,
+                        media_type TEXT NOT NULL,
+                        platform TEXT NOT NULL,
+                        hashtag TEXT,
+                        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_hash ON downloaded_media(media_hash)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_id ON downloaded_media(media_id)')
+                conn.commit()
         except Exception as e:
-            logging.error(f"MediaTracker yükleme hatası: {e}")
-            return {}
-
-    def save_downloaded_media(self):
-        try:
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.downloaded_media, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logging.error(f"MediaTracker kaydetme hatası: {e}")
+            logging.error(f"Veritabanı başlatma hatası: {e}")
 
     def is_media_downloaded(self, media_id, media_url):
         try:
             media_url_str = str(media_url)
             media_hash = hashlib.md5(media_url_str.encode('utf-8')).hexdigest()
-            return media_hash in self.downloaded_media
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM downloaded_media WHERE media_hash = ? OR media_id = ?',
+                             (media_hash, media_id))
+                return cursor.fetchone()[0] > 0
         except Exception as e:
             logging.error(f"Medya kontrol hatası: {e}")
             return False
 
-    def add_media(self, media_id, media_url):
+    def add_media(self, media_id, media_url, file_path, media_type, platform, hashtag=None):
         try:
             media_url_str = str(media_url)
             media_hash = hashlib.md5(media_url_str.encode('utf-8')).hexdigest()
-            self.downloaded_media[media_hash] = {
-                'media_id': media_id,
-                'url': media_url_str,
-                'downloaded_at': datetime.now().isoformat()
-            }
-            self.save_downloaded_media()
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO downloaded_media 
+                    (media_id, media_hash, media_url, file_path, media_type, platform, hashtag)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (media_id, media_hash, media_url_str, file_path, media_type, platform, hashtag))
+                conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            logging.warning(f"Medya zaten var: {media_id}")
+            return False
         except Exception as e:
             logging.error(f"Medya ekleme hatası: {e}")
+            return False
 
 class InstagramDownloaderThread(QThread):
     progress_updated = pyqtSignal(str)
@@ -82,17 +102,15 @@ class InstagramDownloaderThread(QThread):
         self.client = Client()
         self.download_photos = download_photos
         self.download_videos = download_videos
-        self.media_tracker = MediaTracker()
+        self.media_tracker = SQLiteMediaTracker()
 
-    def download_media(self, url, filename, media_id):
+    def download_media(self, url, filename, media_id, media_type):
         try:
-            url_str = str(url)
-            
-            if self.media_tracker.is_media_downloaded(media_id, url_str):
+            if self.media_tracker.is_media_downloaded(media_id, url):
                 self.progress_updated.emit(f"Medya zaten indirilmiş: {os.path.basename(filename)}")
                 return False
 
-            response = requests.get(url_str, stream=True, timeout=30)
+            response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
 
             with open(filename, 'wb') as f:
@@ -104,8 +122,16 @@ class InstagramDownloaderThread(QThread):
                     if chunk:
                         f.write(chunk)
 
-            self.media_tracker.add_media(media_id, url_str)
-            return True
+            if self.media_tracker.add_media(
+                media_id=media_id,
+                media_url=url,
+                file_path=filename,
+                media_type=media_type,
+                platform='instagram',
+                hashtag=self.hashtag
+            ):
+                return True
+            return False
 
         except requests.exceptions.RequestException as e:
             self.download_error.emit(f"İndirme ağ hatası: {str(e)}")
@@ -141,12 +167,14 @@ class InstagramDownloaderThread(QThread):
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     media_id = str(media.id)
 
-                    if media.media_type == 1 and self.download_photos:  # Photo
+                    if media.media_type == 1 and self.download_photos:
                         url = str(media.thumbnail_url)
                         ext = '.jpg'
-                    elif media.media_type == 2 and self.download_videos:  # Video
+                        media_type = 'photo'
+                    elif media.media_type == 2 and self.download_videos:
                         url = str(media.video_url)
                         ext = '.mp4'
+                        media_type = 'video'
                     else:
                         continue
 
@@ -160,9 +188,9 @@ class InstagramDownloaderThread(QThread):
                         f"{self.hashtag}_{timestamp}_{media_id}{ext}"
                     )
 
-                    if self.download_media(url, filename, media_id):
+                    if self.download_media(url, filename, media_id, media_type):
                         downloaded_count += 1
-                        self.progress_count.emit(downloaded_count)
+                        self.progress_count.emit(int((downloaded_count / total_count) * 100))
                         self.progress_updated.emit(
                             f"İndirilen medya {downloaded_count}/{total_count}: "
                             f"{os.path.basename(filename)}"
@@ -170,7 +198,6 @@ class InstagramDownloaderThread(QThread):
                     else:
                         skipped_count += 1
 
-                    # Rate limiting
                     time.sleep(2)
 
                 except Exception as e:
@@ -206,7 +233,7 @@ class InstagramDownloaderGUI(QMainWindow):
         self.load_last_path()
 
     def initUI(self):
-        self.setWindowTitle('Instagram Hashtag İndirici')
+        self.setWindowTitle('Instagram Medya İndirici')
         self.setGeometry(100, 100, 800, 600)
 
         central_widget = QWidget()
@@ -344,7 +371,7 @@ class InstagramDownloaderGUI(QMainWindow):
         if not self.path_input.text().strip():
             QMessageBox.warning(self, 'Hata', 'İndirme klasörü seçilmelidir.')
             return False
-
+        
         if not self.photo_checkbox.isChecked() and not self.video_checkbox.isChecked():
             QMessageBox.warning(self, 'Hata', 'En az bir medya türü seçilmelidir.')
             return False
@@ -403,17 +430,10 @@ class InstagramDownloaderGUI(QMainWindow):
         self.download_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.statusBar().showMessage('İndirme tamamlandı')
-        self.progress_bar.setValue(100)
         QMessageBox.information(self, 'Tamamlandı', message)
 
-    def update_progress(self, count):
-        if self.limit_input.text().strip():
-            try:
-                limit = int(self.limit_input.text())
-                progress = min(int((count / limit) * 100), 100)
-                self.progress_bar.setValue(progress)
-            except ValueError:
-                pass
+    def update_progress(self, progress):
+        self.progress_bar.setValue(progress)
 
     def closeEvent(self, event):
         if self.downloader_thread and self.downloader_thread.isRunning():
