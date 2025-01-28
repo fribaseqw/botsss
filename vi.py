@@ -9,14 +9,15 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                           QHBoxLayout, QLineEdit, QPushButton, QLabel, 
                           QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-                          QCheckBox)
+                          QCheckBox, QComboBox, QTabWidget)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from instagrapi import Client
 import requests
-
+from tiktokapipy.api import TikTokAPI  # DEĞİŞTİ
+import re
 # Logging ayarları
 logging.basicConfig(
-    filename='instagram_downloader.log',
+    filename='social_media_downloader.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -224,7 +225,211 @@ class InstagramDownloaderThread(QThread):
     def stop(self):
         self.is_running = False
 
-class InstagramDownloaderGUI(QMainWindow):
+# TikTokDownloaderThread sınıfını güncelliyoruz
+class TikTokDownloaderThread(QThread):
+    progress_updated = pyqtSignal(str)
+    download_complete = pyqtSignal(str)
+    download_error = pyqtSignal(str)
+    progress_count = pyqtSignal(int)
+
+    def __init__(self, keyword, download_path, limit=None):
+        super().__init__()
+        self.keyword = keyword
+        self.download_path = download_path
+        self.limit = limit
+        self.is_running = True
+        self.media_tracker = SQLiteMediaTracker()
+        self.session = requests.Session()
+        self.session.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.tiktok.com/',
+            'Cookie': 'msToken=your_ms_token_here'  # Bu kısım opsiyonel
+        }
+
+    def get_video_info(self, keyword):
+        try:
+            # TikTok'un web API'sini kullanıyoruz
+            base_url = "https://www.tiktok.com/api/search/general/full/"
+            params = {
+                "aid": "1988",
+                "app_language": "en",
+                "app_name": "tiktok_web",
+                "browser_language": "en-US",
+                "browser_name": "Mozilla",
+                "browser_version": "5.0",
+                "device_platform": "web_pc",
+                "focus_state": "true",
+                "from_page": "search",
+                "keyword": keyword,
+                "offset": "0",
+                "os": "windows",
+                "priority_region": "",
+                "q": keyword,
+                "search_source": "normal_search"
+            }
+
+            response = self.session.get(base_url, params=params)
+            
+            # API yanıtını kontrol et
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except ValueError:
+                    # Alternatif URL dene
+                    alt_url = f"https://www.tiktok.com/tag/{keyword}"
+                    response = self.session.get(alt_url)
+                    if 'props' in response.text:
+                        return self.extract_videos_from_html(response.text)
+            return None
+        except Exception as e:
+            self.download_error.emit(f"Video bilgisi alma hatası: {str(e)}")
+            return None
+
+    def extract_videos_from_html(self, html_content):
+        # HTML içeriğinden video bilgilerini çıkar
+        try:
+            videos = []
+            # Video URL'lerini bul
+            video_pattern = r'"video":{"id":"([^"]+)","downloadAddr":"([^"]+)"'
+            matches = re.findall(video_pattern, html_content)
+            
+            for video_id, download_url in matches:
+                videos.append({
+                    'id': video_id,
+                    'video': {'downloadAddr': download_url.replace('\\u002F', '/')},
+                    'desc': f'Video {video_id}'
+                })
+            
+            return {'data': videos}
+        except Exception as e:
+            self.download_error.emit(f"HTML ayrıştırma hatası: {str(e)}")
+            return None
+
+    def download_video(self, video_data):
+        try:
+            video_id = video_data.get('id', '')
+            video_url = video_data.get('video', {}).get('downloadAddr', '')
+            desc = video_data.get('desc', '').strip()
+            
+            if not video_url or not video_id:
+                return False
+
+            # URL'yi decode et
+            video_url = video_url.replace('\\u002F', '/')
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_desc = "".join(x for x in desc if x.isalnum() or x in (' ', '-', '_'))[:30]
+            filename = os.path.join(
+                self.download_path,
+                f"tiktok_{timestamp}_{safe_desc}_{video_id}.mp4"
+            )
+            
+            if self.media_tracker.is_media_downloaded(video_id, video_url):
+                self.progress_updated.emit(f"Video zaten indirilmiş: {os.path.basename(filename)}")
+                return False
+
+            # Video indirme isteği için özel headers
+            download_headers = {
+                'Range': 'bytes=0-',
+                'Referer': 'https://www.tiktok.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            
+            response = self.session.get(video_url, headers=download_headers, stream=True)
+            response.raise_for_status()
+            
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not self.is_running:
+                        f.close()
+                        os.remove(filename)
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        
+            self.media_tracker.add_media(
+                media_id=video_id,
+                media_url=video_url,
+                file_path=filename,
+                media_type='video',
+                platform='tiktok',
+                hashtag=self.keyword
+            )
+            
+            return True
+            
+        except Exception as e:
+            self.download_error.emit(f"Video indirme hatası: {str(e)}")
+            return False
+
+    def run(self):
+        try:
+            self.progress_updated.emit("TikTok bağlantısı başlatılıyor...")
+            
+            videos = []
+            max_attempts = 3
+            attempt = 0
+
+            while attempt < max_attempts and not videos:
+                data = self.get_video_info(self.keyword)
+                if data and 'data' in data:
+                    videos = [item for item in data['data'] if isinstance(item, dict)]
+                    if self.limit:
+                        videos = videos[:self.limit]
+                    break
+                attempt += 1
+                time.sleep(2)
+
+            if not videos:
+                self.download_error.emit("Video bulunamadı!")
+                return
+
+            downloaded_count = 0
+            skipped_count = 0
+            total_count = len(videos)
+
+            self.progress_updated.emit(f"Toplam {total_count} video bulundu")
+
+            for index, video in enumerate(videos):
+                if not self.is_running:
+                    break
+
+                try:
+                    if self.download_video(video):
+                        downloaded_count += 1
+                        self.progress_count.emit(int((downloaded_count / total_count) * 100))
+                        self.progress_updated.emit(
+                            f"İndirilen video {downloaded_count}/{total_count}: "
+                            f"{video.get('desc', '')[:50]}..."
+                        )
+                    else:
+                        skipped_count += 1
+
+                    time.sleep(2)
+
+                except Exception as e:
+                    self.download_error.emit(f"Video işleme hatası: {str(e)}")
+                    skipped_count += 1
+                    continue
+
+            final_message = (
+                f"İndirme tamamlandı!\n"
+                f"İndirilen: {downloaded_count}\n"
+                f"Atlanan: {skipped_count}\n"
+                f"Toplam: {total_count}"
+            )
+            self.download_complete.emit(final_message)
+
+        except Exception as e:
+            self.download_error.emit(f"Genel hata: {str(e)}")
+
+    def stop(self):
+        self.is_running = False
+class SocialMediaDownloaderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.initUI()
@@ -233,58 +438,31 @@ class InstagramDownloaderGUI(QMainWindow):
         self.load_last_path()
 
     def initUI(self):
-        self.setWindowTitle('Instagram Medya İndirici')
+        self.setWindowTitle('Sosyal Medya İndirici')
         self.setGeometry(100, 100, 800, 600)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
-        # Kullanıcı girişi
-        login_group = QVBoxLayout()
-        
-        username_layout = QHBoxLayout()
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText('Instagram kullanıcı adı')
-        username_layout.addWidget(QLabel('Kullanıcı Adı:'))
-        username_layout.addWidget(self.username_input)
-        login_group.addLayout(username_layout)
+        # Platform seçimi
+        platform_layout = QHBoxLayout()
+        self.platform_combo = QComboBox()
+        self.platform_combo.addItems(['Instagram', 'TikTok'])
+        self.platform_combo.currentTextChanged.connect(self.on_platform_change)
+        platform_layout.addWidget(QLabel('Platform:'))
+        platform_layout.addWidget(self.platform_combo)
+        layout.addLayout(platform_layout)
 
-        password_layout = QHBoxLayout()
-        self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText('Instagram şifresi')
-        self.password_input.setEchoMode(QLineEdit.Password)
-        password_layout.addWidget(QLabel('Şifre:'))
-        password_layout.addWidget(self.password_input)
-        login_group.addLayout(password_layout)
-
-        layout.addLayout(login_group)
-
-        # Medya türü seçimi
-        media_type_layout = QHBoxLayout()
-        self.photo_checkbox = QCheckBox('Fotoğrafları İndir')
-        self.video_checkbox = QCheckBox('Videoları İndir')
-        self.photo_checkbox.setChecked(True)
-        self.video_checkbox.setChecked(True)
-        media_type_layout.addWidget(self.photo_checkbox)
-        media_type_layout.addWidget(self.video_checkbox)
-        layout.addLayout(media_type_layout)
-
-        # Hashtag girişi
-        hashtag_layout = QHBoxLayout()
-        self.hashtag_input = QLineEdit()
-        self.hashtag_input.setPlaceholderText('Hashtag girin (# olmadan)')
-        hashtag_layout.addWidget(QLabel('Hashtag:'))
-        hashtag_layout.addWidget(self.hashtag_input)
-        layout.addLayout(hashtag_layout)
-
-        # Limit girişi
-        limit_layout = QHBoxLayout()
-        self.limit_input = QLineEdit()
-        self.limit_input.setPlaceholderText('Boş bırakın veya sayı girin')
-        limit_layout.addWidget(QLabel('Medya Limiti:'))
-        limit_layout.addWidget(self.limit_input)
-        layout.addLayout(limit_layout)
+        # Tab widget
+        self.tab_widget = QTabWidget()
+        self.instagram_tab = QWidget()
+        self.tiktok_tab = QWidget()
+        self.setup_instagram_tab()
+        self.setup_tiktok_tab()
+        self.tab_widget.addTab(self.instagram_tab, "Instagram")
+        self.tab_widget.addTab(self.tiktok_tab, "TikTok")
+        layout.addWidget(self.tab_widget)
 
         # Kayıt yeri seçimi
         path_layout = QHBoxLayout()
@@ -318,6 +496,86 @@ class InstagramDownloaderGUI(QMainWindow):
         layout.addWidget(self.log_text)
 
         self.statusBar().showMessage('Hazır')
+
+    def setup_instagram_tab(self):
+        layout = QVBoxLayout(self.instagram_tab)
+
+        # Instagram kullanıcı girişi
+        login_group = QVBoxLayout()
+        
+        username_layout = QHBoxLayout()
+        self.instagram_username_input = QLineEdit()
+        self.instagram_username_input.setPlaceholderText('Instagram kullanıcı adı')
+        username_layout.addWidget(QLabel('Kullanıcı Adı:'))
+        username_layout.addWidget(self.instagram_username_input)
+        login_group.addLayout(username_layout)
+
+        password_layout = QHBoxLayout()
+        self.instagram_password_input = QLineEdit()
+        self.instagram_password_input.setPlaceholderText('Instagram şifresi')
+        self.instagram_password_input.setEchoMode(QLineEdit.Password)
+        password_layout.addWidget(QLabel('Şifre:'))
+        password_layout.addWidget(self.instagram_password_input)
+        login_group.addLayout(password_layout)
+
+        layout.addLayout(login_group)
+
+        # Medya türü seçimi
+        media_type_layout = QHBoxLayout()
+        self.photo_checkbox = QCheckBox('Fotoğrafları İndir')
+        self.video_checkbox = QCheckBox('Videoları İndir')
+        self.photo_checkbox.setChecked(True)
+        self.video_checkbox.setChecked(True)
+        media_type_layout.addWidget(self.photo_checkbox)
+        media_type_layout.addWidget(self.video_checkbox)
+        layout.addLayout(media_type_layout)
+
+        # Hashtag girişi
+        hashtag_layout = QHBoxLayout()
+        self.instagram_hashtag_input = QLineEdit()
+        self.instagram_hashtag_input.setPlaceholderText('Hashtag girin (# olmadan)')
+        hashtag_layout.addWidget(QLabel('Hashtag:'))
+        hashtag_layout.addWidget(self.instagram_hashtag_input)
+        layout.addLayout(hashtag_layout)
+
+        # Limit girişi
+        limit_layout = QHBoxLayout()
+        self.instagram_limit_input = QLineEdit()
+        self.instagram_limit_input.setPlaceholderText('Boş bırakın veya sayı girin')
+        limit_layout.addWidget(QLabel('Medya Limiti:'))
+        limit_layout.addWidget(self.instagram_limit_input)
+        layout.addLayout(limit_layout)
+
+        layout.addStretch()
+
+    def setup_tiktok_tab(self):
+        layout = QVBoxLayout(self.tiktok_tab)
+
+        # Arama kelimesi girişi
+        keyword_layout = QHBoxLayout()
+        self.tiktok_keyword_input = QLineEdit()
+        self.tiktok_keyword_input.setPlaceholderText('Arama kelimesi veya hashtag girin')
+        keyword_layout.addWidget(QLabel('Arama:'))
+        keyword_layout.addWidget(self.tiktok_keyword_input)
+        layout.addLayout(keyword_layout)
+
+        # Limit girişi
+        limit_layout = QHBoxLayout()
+        self.tiktok_limit_input = QLineEdit()
+        self.tiktok_limit_input.setPlaceholderText('Boş bırakın veya sayı girin')
+        limit_layout.addWidget(QLabel('Video Limiti:'))
+        limit_layout.addWidget(self.tiktok_limit_input)
+        layout.addLayout(limit_layout)
+
+        # Bilgi etiketi
+        info_label = QLabel("Not: TikTok aramalarında hashtag için '#' kullanabilirsiniz.")
+        info_label.setStyleSheet("color: gray;")
+        layout.addWidget(info_label)
+
+        layout.addStretch()
+
+    def on_platform_change(self, platform):
+        self.tab_widget.setCurrentIndex(0 if platform == 'Instagram' else 1)
 
     def load_last_path(self):
         try:
@@ -356,25 +614,33 @@ class InstagramDownloaderGUI(QMainWindow):
         logging.info(message)
 
     def validate_inputs(self):
-        if not self.username_input.text().strip():
-            QMessageBox.warning(self, 'Hata', 'Kullanıcı adı gereklidir.')
-            return False
-            
-        if not self.password_input.text().strip():
-            QMessageBox.warning(self, 'Hata', 'Şifre gereklidir.')
-            return False
-
-        if not self.hashtag_input.text().strip():
-            QMessageBox.warning(self, 'Hata', 'Hashtag gereklidir.')
-            return False
-
         if not self.path_input.text().strip():
             QMessageBox.warning(self, 'Hata', 'İndirme klasörü seçilmelidir.')
             return False
+
+        current_platform = self.platform_combo.currentText()
         
-        if not self.photo_checkbox.isChecked() and not self.video_checkbox.isChecked():
-            QMessageBox.warning(self, 'Hata', 'En az bir medya türü seçilmelidir.')
-            return False
+        if current_platform == 'Instagram':
+            if not self.instagram_username_input.text().strip():
+                QMessageBox.warning(self, 'Hata', 'Instagram kullanıcı adı gereklidir.')
+                return False
+                
+            if not self.instagram_password_input.text().strip():
+                QMessageBox.warning(self, 'Hata', 'Instagram şifresi gereklidir.')
+                return False
+
+            if not self.instagram_hashtag_input.text().strip():
+                QMessageBox.warning(self, 'Hata', 'Instagram hashtag gereklidir.')
+                return False
+                
+            if not self.photo_checkbox.isChecked() and not self.video_checkbox.isChecked():
+                QMessageBox.warning(self, 'Hata', 'En az bir medya türü seçilmelidir.')
+                return False
+        
+        elif current_platform == 'TikTok':
+            if not self.tiktok_keyword_input.text().strip():
+                QMessageBox.warning(self, 'Hata', 'TikTok arama kelimesi gereklidir.')
+                return False
 
         return True
 
@@ -382,40 +648,68 @@ class InstagramDownloaderGUI(QMainWindow):
         if not self.validate_inputs():
             return
 
-        hashtag = self.hashtag_input.text().strip()
+        current_platform = self.platform_combo.currentText()
         download_path = self.path_input.text().strip()
-        limit_text = self.limit_input.text().strip()
-        username = self.username_input.text().strip()
-        password = self.password_input.text().strip()
-
-        try:
-            limit = int(limit_text) if limit_text else None
-            if limit is not None and limit <= 0:
-                raise ValueError("Limit pozitif olmalıdır")
-        except ValueError as e:
-            QMessageBox.warning(self, 'Hata', f'Geçersiz limit: {str(e)}')
-            return
 
         self.download_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.setValue(0)
         self.log_text.clear()
-        self.log_message("İndirme başlatılıyor...")
 
-        self.downloader_thread = InstagramDownloaderThread(
-            hashtag=hashtag,
-            download_path=download_path,
-            limit=limit,
-            username=username,
-            password=password,
-            download_photos=self.photo_checkbox.isChecked(),
-            download_videos=self.video_checkbox.isChecked()
-        )
+        if current_platform == 'Instagram':
+            hashtag = self.instagram_hashtag_input.text().strip()
+            limit_text = self.instagram_limit_input.text().strip()
+            username = self.instagram_username_input.text().strip()
+            password = self.instagram_password_input.text().strip()
+
+            try:
+                limit = int(limit_text) if limit_text else None
+                if limit is not None and limit <= 0:
+                    raise ValueError("Limit pozitif olmalıdır")
+            except ValueError as e:
+                QMessageBox.warning(self, 'Hata', f'Geçersiz limit: {str(e)}')
+                self.download_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                return
+
+            self.log_message("Instagram indirmesi başlatılıyor...")
+            
+            self.downloader_thread = InstagramDownloaderThread(
+                hashtag=hashtag,
+                download_path=download_path,
+                limit=limit,
+                username=username,
+                password=password,
+                download_photos=self.photo_checkbox.isChecked(),
+                download_videos=self.video_checkbox.isChecked()
+            )
+
+        else:  # TikTok
+            keyword = self.tiktok_keyword_input.text().strip()
+            limit_text = self.tiktok_limit_input.text().strip()
+
+            try:
+                limit = int(limit_text) if limit_text else None
+                if limit is not None and limit <= 0:
+                    raise ValueError("Limit pozitif olmalıdır")
+            except ValueError as e:
+                QMessageBox.warning(self, 'Hata', f'Geçersiz limit: {str(e)}')
+                self.download_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                return
+
+            self.log_message("TikTok indirmesi başlatılıyor...")
+            
+            self.downloader_thread = TikTokDownloaderThread(
+                keyword=keyword,
+                download_path=download_path,
+                limit=limit
+            )
 
         self.downloader_thread.progress_updated.connect(self.log_message)
         self.downloader_thread.download_complete.connect(self.download_finished)
         self.downloader_thread.download_error.connect(self.log_message)
-        self.downloader_thread.progress_count.connect(self.update_progress)
+        self.downloader_thread.progress_count.connect(self.progress_bar.setValue)
         self.downloader_thread.start()
 
     def stop_download(self):
@@ -431,9 +725,6 @@ class InstagramDownloaderGUI(QMainWindow):
         self.stop_button.setEnabled(False)
         self.statusBar().showMessage('İndirme tamamlandı')
         QMessageBox.information(self, 'Tamamlandı', message)
-
-    def update_progress(self, progress):
-        self.progress_bar.setValue(progress)
 
     def closeEvent(self, event):
         if self.downloader_thread and self.downloader_thread.isRunning():
@@ -454,7 +745,7 @@ class InstagramDownloaderGUI(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    ex = InstagramDownloaderGUI()
+    ex = SocialMediaDownloaderGUI()
     ex.show()
     sys.exit(app.exec_())
 
