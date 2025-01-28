@@ -242,17 +242,24 @@ class TikTokDownloaderThread(QThread):
         self.limit = limit
         self.is_running = True
         self.media_tracker = SQLiteMediaTracker()
-        self.session = requests.Session()
 
     def get_video_info(self, keyword):
         try:
-            # Direkt web sayfasından veri çekme
+            # Hashtag veya arama kelimesi kontrolü
+            if keyword.startswith('#'):
+                encoded_keyword = keyword[1:]  # # işaretini kaldır
+                url = f"https://www.tiktok.com/tag/{encoded_keyword}"
+            else:
+                encoded_keyword = keyword
+                url = f"https://www.tiktok.com/search?q={encoded_keyword}"
+
             headers = {
                 'authority': 'www.tiktok.com',
                 'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'accept-language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-                'cache-control': 'max-age=0',
-                'sec-ch-ua': '"Not?A_Brand";v="8", "Chromium";v="108"',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
                 'sec-fetch-dest': 'document',
@@ -260,78 +267,122 @@ class TikTokDownloaderThread(QThread):
                 'sec-fetch-site': 'none',
                 'sec-fetch-user': '?1',
                 'upgrade-insecure-requests': '1',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
 
-            # TikTok arama sayfasına git
-            search_url = f"https://www.tiktok.com/tag/{keyword}" if keyword.startswith('#') else f"https://www.tiktok.com/search?q={keyword}"
-            response = self.session.get(search_url, headers=headers)
-            
+            response = requests.get(url, headers=headers)
+
             if response.status_code != 200:
-                return None
+                self.download_error.emit(f"Sayfa yüklenemedi: HTTP {response.status_code}")
+                return []
 
-            # Video bilgilerini çıkar
+            # Daha kapsamlı regex pattern'ler
+            patterns = [
+                # Pattern 1: Standart video data
+                r'"videoData":\s*({[^}]+})',
+                # Pattern 2: Video URL pattern
+                r'"playAddr":"([^"]+)".*?"id":"(\d+)".*?"desc":"([^"]+)"',
+                # Pattern 3: Alternatif video data
+                r'<script id="SIGI_STATE" type="application/json">(.*?)</script>',
+                # Pattern 4: Video detayları
+                r'"video":{"id":"([^"]+)","desc":"([^"]+)","playAddr":"([^"]+)"'
+            ]
+
             videos = []
-            video_pattern = r'"aweme_id":"([\w\d]+)","desc":"([^"]*)".*?"play_addr":{"uri":"([^"]*)"'
-            matches = re.finditer(video_pattern, response.text)
-            
-            for match in matches:
-                video_id, desc, video_url = match.groups()
-                video_url = video_url.replace('\\u002F', '/').replace('\\u0026', '&')
-                
-                if not video_url.startswith('http'):
-                    video_url = f"https://www.tiktok.com/tos-useast2a-ve-0068c002/{video_url}"
-                
-                video_info = {
-                    'id': video_id,
-                    'desc': desc,
-                    'video_url': video_url,
-                    'download_url': video_url
-                }
-                videos.append(video_info)
+            html_content = response.text
 
-            return videos[:self.limit] if self.limit else videos
+            for pattern in patterns:
+                matches = re.finditer(pattern, html_content)
+                for match in matches:
+                    try:
+                        if len(match.groups()) == 1 and '{' in match.group(1):
+                            # JSON verisi içeren pattern
+                            data = json.loads(match.group(1))
+                            if 'playAddr' in str(data):
+                                video_url = data.get('playAddr', '')
+                                video_id = data.get('id', '')
+                                desc = data.get('desc', '')
+                        else:
+                            # URL pattern
+                            if len(match.groups()) == 3:
+                                if pattern == patterns[1]:  # Pattern 2
+                                    video_url, video_id, desc = match.groups()
+                                else:  # Pattern 4
+                                    video_id, desc, video_url = match.groups()
+                            else:
+                                continue
+
+                        # URL'yi temizle
+                        video_url = video_url.replace('\\u002F', '/').replace('\\\\u002F', '/').replace('&amp;', '&')
+
+                        # Tam URL kontrolü
+                        if not video_url.startswith('http'):
+                            video_url = f"https://www.tiktok.com{video_url}"
+
+                        if video_url and video_id:
+                            video_info = {
+                                'id': video_id,
+                                'desc': desc,
+                                'url': video_url
+                            }
+                            if video_info not in videos:  # Tekrarları önle
+                                videos.append(video_info)
+
+                    except Exception as e:
+                        continue
+
+            # Debug bilgisi
+            if not videos:
+                self.download_error.emit("Video bulunamadı! HTML içeriği kontrol ediliyor...")
+                # HTML içeriğini kaydet (debug için)
+                with open('tiktok_debug.html', 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+
+            return videos[:self.limit] if self.limit and videos else videos
 
         except Exception as e:
             self.download_error.emit(f"Video bilgisi alma hatası: {str(e)}")
-            return None
-
+            return []
     def download_video(self, video_info):
         try:
             video_id = video_info['id']
-            video_url = video_info['download_url']
+            video_url = video_info['url']
             desc = video_info['desc']
-
+    
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             safe_desc = "".join(x for x in desc if x.isalnum() or x in (' ', '-', '_'))[:30]
             filename = os.path.join(
                 self.download_path,
-                f"tiktok_{timestamp}_{safe_desc}_{video_id}.mp4"
+                f"tiktok_{timestamp}_{safe_desc}.mp4"
             )
-
+    
             if self.media_tracker.is_media_downloaded(video_id, video_url):
                 self.progress_updated.emit(f"Video zaten indirilmiş: {os.path.basename(filename)}")
                 return False
-
+    
             headers = {
-                'Range': 'bytes=0-',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Referer': 'https://www.tiktok.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'Range': 'bytes=0-',
+                'Accept': '*/*',
+                'Origin': 'https://www.tiktok.com',
+                'Sec-Fetch-Site': 'cross-site',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Dest': 'video'
             }
-
-            response = self.session.get(video_url, headers=headers, stream=True)
-            if response.status_code not in [200, 206]:
-                return False
-
-            with open(filename, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not self.is_running:
-                        f.close()
-                        os.remove(filename)
-                        return False
-                    if chunk:
-                        f.write(chunk)
-
+    
+            with requests.get(video_url, headers=headers, stream=True) as response:
+                response.raise_for_status()
+                
+                with open(filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not self.is_running:
+                            f.close()
+                            os.remove(filename)
+                            return False
+                        if chunk:
+                            f.write(chunk)
+    
             self.media_tracker.add_media(
                 media_id=video_id,
                 media_url=video_url,
@@ -340,19 +391,22 @@ class TikTokDownloaderThread(QThread):
                 platform='tiktok',
                 hashtag=self.keyword
             )
-
+    
             return True
-
+    
         except Exception as e:
             self.download_error.emit(f"Video indirme hatası: {str(e)}")
+            if 'filename' in locals():
+                try:
+                    os.remove(filename)
+                except:
+                    pass
             return False
-
     def run(self):
         try:
             self.progress_updated.emit("TikTok bağlantısı başlatılıyor...")
-            
             videos = self.get_video_info(self.keyword)
-            
+
             if not videos:
                 self.download_error.emit("Video bulunamadı!")
                 return
@@ -377,8 +431,6 @@ class TikTokDownloaderThread(QThread):
                         )
                     else:
                         skipped_count += 1
-
-                    time.sleep(1)  # Rate limiting
 
                 except Exception as e:
                     self.download_error.emit(f"Video işleme hatası: {str(e)}")
