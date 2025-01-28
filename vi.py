@@ -26,7 +26,7 @@ class SQLiteMediaTracker:
     def __init__(self, db_path="downloads.db"):
         self.db_path = db_path
         self.init_database()
-        self.setup_tiktok_tab()
+        
     def init_database(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -240,115 +240,88 @@ class TikTokDownloaderThread(QThread):
         self.keyword = keyword
         self.download_path = download_path
         self.limit = limit
-        self.setup_tiktok_tab()
         self.is_running = True
         self.media_tracker = SQLiteMediaTracker()
         self.session = requests.Session()
-        self.msToken = hashlib.md5(str(time.time()).encode()).hexdigest()
-        self.session.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'Origin': 'https://www.tiktok.com',
-            'Referer': 'https://www.tiktok.com/',
-            'Connection': 'keep-alive',
-            'Cookie': f'msToken={self.msToken};'
-        }
 
     def get_video_info(self, keyword):
         try:
-            # Web search URL'ini kullanalım
-            search_url = "https://www.tiktok.com/api/search/general/full/"
-            params = {
-                "aid": "1988",
-                "app_language": "tr-TR",
-                "app_name": "tiktok_web",
-                "browser_language": "tr-TR",
-                "browser_name": "Mozilla",
-                "browser_online": "true",
-                "browser_platform": "Win32",
-                "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "channel": "tiktok_web",
-                "cookie_enabled": "true",
-                "device_id": str(int(time.time() * 1000)),
-                "device_platform": "web_pc",
-                "focus_state": "true",
-                "from_page": "search",
-                "history_len": "2",
-                "is_fullscreen": "false",
-                "is_page_visible": "true",
-                "keyword": keyword,
-                "msToken": self.msToken,
-                "os": "windows",
-                "priority_region": "TR",
-                "q": keyword,
-                "region": "TR",
-                "screen_height": "1080",
-                "screen_width": "1920",
-                "search_source": "normal_search",
-                "timezone_name": "Europe/Istanbul"
+            # Direkt web sayfasından veri çekme
+            headers = {
+                'authority': 'www.tiktok.com',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'accept-language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+                'cache-control': 'max-age=0',
+                'sec-ch-ua': '"Not?A_Brand";v="8", "Chromium";v="108"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'none',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
             }
-            
-            response = self.session.get(search_url, params=params)
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    videos = []
-                    
-                    for item in data.get('data', []):
-                        if isinstance(item, dict) and 'item' in item:
-                            video = item.get('item', {})
-                            if video.get('video'):
-                                video_info = {
-                                    'id': video.get('id'),
-                                    'desc': video.get('desc', ''),
-                                    'video_url': video.get('video', {}).get('playAddr', ''),
-                                    'author': video.get('author', {}).get('uniqueId', 'unknown'),
-                                    'download_url': video.get('video', {}).get('downloadAddr', '')
-                                }
-                                if video_info['id'] and (video_info['video_url'] or video_info['download_url']):
-                                    videos.append(video_info)
-                    
-                    return videos
-                except json.JSONDecodeError:
-                    self.download_error.emit("JSON ayrıştırma hatası")
-                    return []
-            else:
-                self.download_error.emit(f"API yanıt hatası: {response.status_code}")
-                return []
-                
-        except Exception as e:
-            self.download_error.emit(f"Video arama hatası: {str(e)}")
-            return []
 
-    def download_video(self, video_data):
+            # TikTok arama sayfasına git
+            search_url = f"https://www.tiktok.com/tag/{keyword}" if keyword.startswith('#') else f"https://www.tiktok.com/search?q={keyword}"
+            response = self.session.get(search_url, headers=headers)
+            
+            if response.status_code != 200:
+                return None
+
+            # Video bilgilerini çıkar
+            videos = []
+            video_pattern = r'"aweme_id":"([\w\d]+)","desc":"([^"]*)".*?"play_addr":{"uri":"([^"]*)"'
+            matches = re.finditer(video_pattern, response.text)
+            
+            for match in matches:
+                video_id, desc, video_url = match.groups()
+                video_url = video_url.replace('\\u002F', '/').replace('\\u0026', '&')
+                
+                if not video_url.startswith('http'):
+                    video_url = f"https://www.tiktok.com/tos-useast2a-ve-0068c002/{video_url}"
+                
+                video_info = {
+                    'id': video_id,
+                    'desc': desc,
+                    'video_url': video_url,
+                    'download_url': video_url
+                }
+                videos.append(video_info)
+
+            return videos[:self.limit] if self.limit else videos
+
+        except Exception as e:
+            self.download_error.emit(f"Video bilgisi alma hatası: {str(e)}")
+            return None
+
+    def download_video(self, video_info):
         try:
-            video_id = video_data['id']
-            video_url = video_data.get('download_url') or video_data.get('video_url')
-            author = video_data['author']
-            desc = video_data['desc']
+            video_id = video_info['id']
+            video_url = video_info['download_url']
+            desc = video_info['desc']
 
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             safe_desc = "".join(x for x in desc if x.isalnum() or x in (' ', '-', '_'))[:30]
             filename = os.path.join(
                 self.download_path,
-                f"tiktok_{author}_{timestamp}_{safe_desc}.mp4"
+                f"tiktok_{timestamp}_{safe_desc}_{video_id}.mp4"
             )
 
             if self.media_tracker.is_media_downloaded(video_id, video_url):
                 self.progress_updated.emit(f"Video zaten indirilmiş: {os.path.basename(filename)}")
                 return False
 
-            download_headers = {
-                **self.session.headers,
-                'Accept': 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5',
-                'Range': 'bytes=0-'
+            headers = {
+                'Range': 'bytes=0-',
+                'Referer': 'https://www.tiktok.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
 
-            response = self.session.get(video_url, headers=download_headers, stream=True)
-            response.raise_for_status()
+            response = self.session.get(video_url, headers=headers, stream=True)
+            if response.status_code not in [200, 206]:
+                return False
 
             with open(filename, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -372,35 +345,17 @@ class TikTokDownloaderThread(QThread):
 
         except Exception as e:
             self.download_error.emit(f"Video indirme hatası: {str(e)}")
-            if 'filename' in locals():
-                try:
-                    os.remove(filename)
-                except:
-                    pass
             return False
 
     def run(self):
         try:
             self.progress_updated.emit("TikTok bağlantısı başlatılıyor...")
             
-            max_retries = 3
-            retry_count = 0
-            videos = []
-
-            while not videos and retry_count < max_retries:
-                videos = self.get_video_info(self.keyword)
-                if not videos:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        self.progress_updated.emit(f"Yeniden deneniyor... ({retry_count}/{max_retries})")
-                        time.sleep(2)
-
+            videos = self.get_video_info(self.keyword)
+            
             if not videos:
                 self.download_error.emit("Video bulunamadı!")
                 return
-
-            if self.limit:
-                videos = videos[:self.limit]
 
             total_count = len(videos)
             self.progress_updated.emit(f"Toplam {total_count} video bulundu")
@@ -423,7 +378,7 @@ class TikTokDownloaderThread(QThread):
                     else:
                         skipped_count += 1
 
-                    time.sleep(1)  # Rate limiting azaltıldı
+                    time.sleep(1)  # Rate limiting
 
                 except Exception as e:
                     self.download_error.emit(f"Video işleme hatası: {str(e)}")
@@ -510,6 +465,30 @@ class SocialMediaDownloaderGUI(QMainWindow):
         layout.addWidget(self.log_text)
 
         self.statusBar().showMessage('Hazır')
+
+    def on_platform_change(self, platform):
+        """
+        Platform değiştiğinde sekmeler arasında geçiş yapar
+        """
+        if platform == 'Instagram':
+            self.tab_widget.setCurrentWidget(self.instagram_tab)
+            self.tiktok_keyword_input.clear()
+            self.tiktok_limit_input.clear()
+        else:  # TikTok
+            self.tab_widget.setCurrentWidget(self.tiktok_tab)
+            self.instagram_username_input.clear()
+            self.instagram_password_input.clear()
+            self.instagram_hashtag_input.clear()
+            self.instagram_limit_input.clear()
+
+        # Platform değiştiğinde indirme butonunu aktif et
+        self.download_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.log_text.clear()
+        self.statusBar().showMessage('Hazır')
+
+
 
     def setup_instagram_tab(self):
         layout = QVBoxLayout(self.instagram_tab)
