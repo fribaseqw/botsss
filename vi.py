@@ -350,29 +350,31 @@ class TikTokDownloaderThread(QThread):
 
     def download_video(self, video_info):
         try:
-            video_id = video_info['id']
-            video_url = video_info['video']['downloadAddr']
+            # Video bilgilerini çıkar
+            video_id = str(video_info['id'])  # video ID'sini string'e çevir
+            video_url = str(video_info['video']['downloadAddr'])
             desc = f"{video_info['author']} - {video_info['desc']}"
-
-            # Create a safe filename
+    
+            # Önce video daha önce indirilmiş mi kontrol et
+            if self.media_tracker.is_media_downloaded(video_id, video_url):
+                self.progress_updated.emit(f"Video zaten indirilmiş: {desc[:50]}...")
+                return False
+    
+            # Güvenli dosya adı oluştur
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            safe_desc = re.sub(r'[^\w\s-]', '', desc)[:30]
-            safe_desc = re.sub(r'\s+', '_', safe_desc.strip())
+            safe_desc = re.sub(r'[^\w\s-]', '', desc)[:50]
+            safe_desc = re.sub(r'[\s_-]+', '_', safe_desc.strip())
             filename = os.path.join(
                 self.download_path,
-                f"tiktok_{timestamp}_{safe_desc}.mp4"
+                f"tiktok_{video_id}_{timestamp}_{safe_desc}.mp4"
             )
-
-            if self.media_tracker.is_media_downloaded(video_id, video_url):
-                self.progress_updated.emit(f"Video zaten indirilmiş: {os.path.basename(filename)}")
-                return False
-
+    
             headers = {
                 'Range': 'bytes=0-',
                 'Referer': 'https://www.tiktok.com/',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
-
+    
             max_retries = 3
             retry_count = 0
             
@@ -398,34 +400,40 @@ class TikTokDownloaderThread(QThread):
                                     progress = (downloaded / total_size) * 100
                                     self.progress_count.emit(int(progress))
                     
-                    break
-                    
+                    # Video başarıyla indirildi, veritabanına ekle
+                    if self.media_tracker.add_media(
+                        media_id=video_id,
+                        media_url=video_url,
+                        file_path=filename,
+                        media_type='video',
+                        platform='tiktok',
+                        hashtag=self.keyword
+                    ):
+                        self.progress_updated.emit(f"Video başarıyla indirildi ve kaydedildi: {desc[:50]}")
+                        return True
+                    else:
+                        # Veritabanına eklenemedi, dosyayı sil
+                        os.remove(filename)
+                        return False
+                        
                 except requests.exceptions.RequestException as e:
                     retry_count += 1
                     if retry_count == max_retries:
                         raise e
                     time.sleep(2)
-
-            self.media_tracker.add_media(
-                media_id=video_id,
-                media_url=video_url,
-                file_path=filename,
-                media_type='video',
-                platform='tiktok',
-                hashtag=self.keyword
-            )
-
+    
             return True
-
+    
         except Exception as e:
-            self.download_error.emit(f"Video indirme hatası: {str(e)}")
+            error_msg = f"Video indirme hatası: {str(e)}"
+            self.download_error.emit(error_msg)
+            logging.error(error_msg)
             if 'filename' in locals():
                 try:
                     os.remove(filename)
                 except:
                     pass
             return False
-
     def run(self):
         try:
             self.progress_updated.emit("TikTok indirmesi başlatılıyor...")
