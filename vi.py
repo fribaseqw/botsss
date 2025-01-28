@@ -15,6 +15,8 @@ from instagrapi import Client
 import requests
 from tiktokapipy.api import TikTokAPI  # DEĞİŞTİ
 import re
+from bs4 import BeautifulSoup
+import requests
 # Logging ayarları
 logging.basicConfig(
     filename='social_media_downloader.log',
@@ -227,6 +229,7 @@ class InstagramDownloaderThread(QThread):
 
 # TikTokDownloaderThread sınıfını güncelliyoruz
 # TikTokDownloaderThread sınıfını güncelliyoruz
+# TikTokDownloaderThread sınıfını güncelliyoruz
 class TikTokDownloaderThread(QThread):
     progress_updated = pyqtSignal(str)
     download_complete = pyqtSignal(str)
@@ -240,18 +243,61 @@ class TikTokDownloaderThread(QThread):
         self.limit = limit
         self.is_running = True
         self.media_tracker = SQLiteMediaTracker()
-        self.api = TikTokAPI()
+
+    def build_search_url(self, keyword):
+        base_url = "https://www.tiktok.com/search/video?q="
+        search_query = keyword.replace(' ', '%20')
+        search_url = f"{base_url}{search_query}&t=1738088936940"
+        return search_url
 
     def get_video_info(self, keyword):
         try:
-            # TikTok API kullanarak keyword ile video arama
-            results = self.api.search_videos_by_keyword(keyword, count=self.limit)
-            if results and 'itemList' in results:
-                return results['itemList']
-            return []
+            search_url = self.build_search_url(keyword)
+            response = requests.get(search_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            video_urls = []
+            for video in soup.find_all('a', href=True):
+                if '/video/' in video['href']:
+                    video_urls.append(f"https://www.tiktok.com{video['href']}")
+                    if self.limit and len(video_urls) >= self.limit:
+                        break
+
+            if not video_urls:
+                self.download_error.emit("Video bulunamadı!")
+                return []
+
+            video_info_list = []
+            for video_url in video_urls:
+                video_info = self.extract_video_info(video_url)
+                if video_info:
+                    video_info_list.append(video_info)
+                    
+            return video_info_list
+
         except Exception as e:
             self.download_error.emit(f"Video bilgisi alma hatası: {str(e)}")
             return []
+
+    def extract_video_info(self, video_url):
+        try:
+            response = requests.get(video_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            video_tag = soup.find('video')
+            if video_tag:
+                video_info = {
+                    'id': video_url.split('/')[-1],
+                    'video': {'downloadAddr': video_tag['src']},
+                    'desc': soup.find('title').text.strip(),
+                    'url': video_url
+                }
+                return video_info
+            return None
+        except Exception as e:
+            self.download_error.emit(f"Video bilgisi çıkarma hatası: {str(e)}")
+            return None
 
     def download_video(self, video_info):
         try:
@@ -271,7 +317,7 @@ class TikTokDownloaderThread(QThread):
                 return False
 
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Safari/537.36',
                 'Referer': 'https://www.tiktok.com/',
                 'Range': 'bytes=0-'
             }
@@ -356,9 +402,6 @@ class TikTokDownloaderThread(QThread):
 
     def stop(self):
         self.is_running = False
-
-# TikTokDownloaderThread sınıfını yukarıdaki şekilde güncelledik
-
 class SocialMediaDownloaderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
